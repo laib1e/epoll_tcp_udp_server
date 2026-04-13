@@ -5,11 +5,51 @@
 #include <cstring>
 #include <unistd.h>
 #include <iostream>
+#include <algorithm>
+#include <vector>
+#include <ctime>
 
+struct stats 
+{
+    bool running;
+    int total_connections;
+    int active_connections;
+};
 constexpr int MAX_EVENTS = 10;
+
+std::string process_message(const char* buf, int len, stats *stat) 
+{
+    char buffer[80] = "";
+
+    if (strcmp(buf, "stats") == 0) 
+    {
+        sprintf(buffer, "total=%d, active=%d", stat->total_connections, stat->active_connections);
+    }
+
+    if (strcmp(buf, "time") == 0) 
+    {
+        std::time_t now = std::time(nullptr);
+        std::tm* local_tm = std::localtime(&now);
+        strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", local_tm);
+    }
+
+    if (strcmp(buf, "shutdown") == 0) 
+    {
+        stat->running = false;
+    }
+
+    return buffer;
+}
 
 int main() 
 {
+    stats stat 
+    {
+        .running = true,
+        .total_connections = 0,
+        .active_connections = 0,
+    };
+
     int server_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (server_socket == -1) return -1;
     {
@@ -54,7 +94,9 @@ int main()
     ev.data.fd = udp_socket;
     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, udp_socket, &ev);
 
-    while (true) 
+    std::vector<int> client_fds;
+
+    while (stat.running) 
     {
         int wait = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
 
@@ -68,6 +110,9 @@ int main()
                 ev.events = EPOLLIN;
                 ev.data.fd = conn_sock;
                 epoll_ctl(epoll_fd, EPOLL_CTL_ADD, conn_sock, &ev);
+                client_fds.push_back(conn_sock);
+                stat.active_connections++;
+                stat.total_connections++;
             } else if (events[i].data.fd == udp_socket) {
                 char buf[1024];
                 sockaddr_in udp_client_address;
@@ -75,8 +120,14 @@ int main()
                 int n = recvfrom(events[i].data.fd, buf, sizeof(buf), 0, (struct sockaddr*)&udp_client_address, &len);
                 if (n > 0) 
                 {
-                    std::cout << "UDP received: " << n << " bytes" << std::endl;
-                    sendto(events[i].data.fd, buf, n, 0, (const struct sockaddr*)&udp_client_address, len);
+                    if (buf[0] == '/') 
+                    {
+                        buf[n - 1] = '\0';
+                        std::string response = process_message(buf + 1, n - 1, &stat);
+                        sendto(events[i].data.fd, response.data(), response.length(), 0, (const struct sockaddr*)&udp_client_address, len);
+                    } else {
+                        sendto(events[i].data.fd, buf, n, 0, (const struct sockaddr*)&udp_client_address, len);
+                    }
                 }
             } else {
                 char buf[1024];
@@ -85,12 +136,27 @@ int main()
                 {
                     close(events[i].data.fd);
                     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, events[i].data.fd, nullptr);
+                    client_fds.erase(std::remove(client_fds.begin(), client_fds.end(), events[i].data.fd), client_fds.end());
+                    stat.active_connections--;
                 } else {
-                    write(events[i].data.fd, buf, n);
+                    if (buf[0] == '/') 
+                    {
+                        buf[n - 1] = '\0';
+                        std::string response = process_message(buf + 1, n - 1, &stat);
+                        write(events[i].data.fd, response.data(), response.length());
+                    } else {
+                        write(events[i].data.fd, buf, n);
+                    }
                 }
             }
-
-
         }
     }
+
+    for (int fd : client_fds) {
+        close(fd);
+    }
+    
+    close(epoll_fd);
+    close(server_socket);
+    close(udp_socket);
 }
